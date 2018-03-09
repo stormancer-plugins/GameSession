@@ -1,0 +1,7 @@
+.vs
+packages
+_app.json
+bin
+obj
+*.nupkg
+*.user
