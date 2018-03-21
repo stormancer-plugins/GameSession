@@ -63,7 +63,7 @@ namespace Stormancer.Server.GameSession
     }
 
     public class GameSessionResult
-    {
+     {
         public GameSessionResult(string userId,IScenePeerClient client, Stream data)
         {
             Peer = client;

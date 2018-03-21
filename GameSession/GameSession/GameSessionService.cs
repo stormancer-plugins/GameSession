@@ -39,24 +39,6 @@ namespace Stormancer.Server.GameSession
 
     internal class GameSessionService : IGameSessionService
     {
-        private const string LOG_CATEOGRY = "Game session service";
-        private const string P2P_TOKEN_ROUTE = "player.p2ptoken";
-
-        private readonly IUserSessions _sessions;
-        private readonly IConfiguration _configuration;
-        private readonly ILogger _logger;
-        private readonly ISceneHost _scene;
-        private readonly IEnvironment _environment;
-        private readonly IDelegatedTransports _pools;
-        private readonly Func<IEnumerable<IGameSessionEventHandler>> _eventHandlers;
-
-        private GameSessionConfiguration _config;
-
-        //private string host;
-
-        private System.Diagnostics.Process _gameServerProcess;
-        private byte[] _serverGuid;
-
         private class Client
         {
             public Client(IScenePeerClient peer)
@@ -81,6 +63,27 @@ namespace Stormancer.Server.GameSession
 
             public TaskCompletionSource<Action<Stream, ISerializer>> GameCompleteTcs { get; private set; }
         }
+
+        // Constant variable
+        private const string LOG_CATEOGRY = "Game session service";
+        private const string P2P_TOKEN_ROUTE = "player.p2ptoken";
+        private const string ALL_PLAYER_READY_ROUTE = "players.allReady";
+
+        // Stormancer object
+        private readonly IUserSessions _sessions;
+        private readonly IConfiguration _configuration;
+        private readonly ILogger _logger;
+        private readonly ISceneHost _scene;
+        private readonly IEnvironment _environment;
+        private readonly IDelegatedTransports _pools;
+        private readonly Func<IEnumerable<IGameSessionEventHandler>> _eventHandlers;
+
+        private GameSessionConfiguration _config;
+
+        // Dedicated game session 
+        private System.Diagnostics.Process _gameServerProcess;
+        private byte[] _serverGuid;              
+
         private ConcurrentDictionary<string, Client> _clients = new ConcurrentDictionary<string, Client>();
         private ConcurrentDictionary<long, string> _peerIdToUserIdMap = new ConcurrentDictionary<long, string>();
         private ServerStatus _status = ServerStatus.WaitingPlayers;
@@ -92,6 +95,8 @@ namespace Stormancer.Server.GameSession
         private IDisposable _p2pPortLease;
         private ushort _p2pPort;
         private string _p2pToken;
+        private bool _serverEnabled;
+        private bool _broadcastPlayerStatus;
 
         public GameSessionService(
             ISceneHost scene,
@@ -109,9 +114,12 @@ namespace Stormancer.Server.GameSession
             _configuration = configuration;
             _logger = logger;
             _environment = environment;
-            _pools = pools;
+            _pools = pools; 
 
             _eventHandlers = eventHandlers;
+
+            _configuration.SettingsChanged += OnSettingsChange;
+            OnSettingsChange(_configuration, _configuration.Settings);
 
             scene.Shuttingdown.Add(args =>
             {
@@ -125,6 +133,10 @@ namespace Stormancer.Server.GameSession
             scene.AddRoute("player.faulted", ReceivedFaulted, _ => _);
         }
 
+        private void OnSettingsChange(Object sender, dynamic settings)
+        {
+            _serverEnabled = ((bool?)_configuration?.Settings?.gameServer?.dedicatedServer) ?? false;
+        }
 
         private Task<string> GetUserId(IScenePeerClient peer)
         {
@@ -178,10 +190,10 @@ namespace Stormancer.Server.GameSession
                 {
                     if (_status == ServerStatus.Started)
                     {
-                        _scene.Send(new MatchPeerFilter(peer), "server.started", s =>
+                        _scene.Send(new MatchPeerFilter(peer), P2P_TOKEN_ROUTE, s =>
                         {
                             var serializer = peer.Serializer();
-                            serializer.Serialize(new GameServerStartMessage { P2PToken = _p2pToken }, s);
+                            serializer.Serialize(_p2pToken, s);
                         }, PacketPriority.MEDIUM_PRIORITY, PacketReliability.RELIABLE);
                     }
                     return;
@@ -208,6 +220,10 @@ namespace Stormancer.Server.GameSession
 
                     BroadcastClientUpdate(currentClient, user, packet.ReadObject<string>());
                 }
+                if(_clients.Values.All(c=>c.Status == PlayerStatus.Ready))
+                {
+                    _scene.Send(new MatchAllFilter(), ALL_PLAYER_READY_ROUTE, s => { }, PacketPriority.MEDIUM_PRIORITY, PacketReliability.RELIABLE);
+                }
 
                 if (user == _hostUserId && (((bool?)_configuration.Settings.gameSession?.usep2p) == true))
                 {
@@ -219,8 +235,9 @@ namespace Stormancer.Server.GameSession
                     {
                         p.Send(P2P_TOKEN_ROUTE, p2pToken);
                     }
+                    await TryStart();
                 }
-                await TryStart();
+
             }
             catch (Exception ex)
             {
@@ -284,9 +301,7 @@ namespace Stormancer.Server.GameSession
         {
             if (peer.ContentType == "application/server-id")
             {
-                var peerGuid = new Guid(peer.UserData);
-                var serverGuid = new Guid(_serverGuid);
-                if (serverGuid == peerGuid)
+                if (IsServer(peer))
                 {
                     return;
                 }
@@ -295,6 +310,7 @@ namespace Stormancer.Server.GameSession
                     throw new ClientException("Failed to authenticate as dedicated server");
                 }
             }
+
             if (IsWorker(peer))
             {
                 return;
@@ -343,14 +359,19 @@ namespace Stormancer.Server.GameSession
         {
             _p2pToken = await _scene.DependencyResolver.Resolve<IPeerInfosService>().CreateP2pToken(peerId);
             _logger.Log(LogLevel.Trace, "gameserver", "Server responded as ready.", new { Port = _serverPort, P2PPort = _p2pPort });
-            _scene.Broadcast("server.started", new GameServerStartMessage { P2PToken = _p2pToken });
+
+            foreach (var p in _scene.RemotePeers.Where(p => p.Id != peerId))
+            {
+                p.Send(P2P_TOKEN_ROUTE, _p2pToken);
+            }
+            //_scene.Broadcast(P2P_TOKEN_ROUTE, _p2pToken);
             _status = ServerStatus.Started;
         }
+
         public bool IsServer(IScenePeerClient peer)
         {
-
             if (peer != null && peer.ContentType == "application/server-id")
-            {
+            {        
                 var peerGuid = new Guid(peer.UserData);
                 var serverGuid = new Guid(_serverGuid);
                 return serverGuid == peerGuid;
@@ -360,17 +381,18 @@ namespace Stormancer.Server.GameSession
                 return false;
             }
         }
+
         private async Task PeerConnected(IScenePeerClient peer)
         {
             if (IsServer(peer))
             {
                 _serverPeer = peer;
+
+                peer.Send(P2P_TOKEN_ROUTE, "");
                 return;
             }
             if (!IsWorker(peer))
             {
-
-
                 if (peer == null)
                 {
                     throw new ArgumentNullException("peer");
@@ -382,16 +404,24 @@ namespace Stormancer.Server.GameSession
                     throw new ClientException("You are not authenticated.");
                 }
 
-                // If the host is not defined a P2P was sent with "" to notify client is host.
-                if("" == Interlocked.CompareExchange<string>(ref _hostUserId, userId, ""))
+                //Check if the gameSession is Dedicated or client-host            
+                if (!_serverEnabled)
                 {
-                    _logger.Log(LogLevel.Debug, LOG_CATEOGRY, "Host defined and connecting", userId);
-                    peer.Send(P2P_TOKEN_ROUTE, "");
+                    // If the host is not defined a P2P was sent with "" to notify client is host.
+                    if ("" == Interlocked.CompareExchange<string>(ref _hostUserId, userId, ""))
+                    {
+                        _logger.Log(LogLevel.Debug, LOG_CATEOGRY, "Host defined and connecting", userId);
+                        peer.Send(P2P_TOKEN_ROUTE, "");
+                    }
+                    else
+                    {
+                        _logger.Log(LogLevel.Debug, LOG_CATEOGRY, "Client connecting", userId);
+                    }
                 }
                 else
                 {
-                    _logger.Log(LogLevel.Debug, LOG_CATEOGRY, "Client connecting", userId);
-                }              
+                    await TryStart();
+                }
 
                 foreach (var uId in _clients.Keys)
                 {
@@ -411,7 +441,7 @@ namespace Stormancer.Server.GameSession
                     _p2pToken = await _scene.DependencyResolver.Resolve<IPeerInfosService>().CreateP2pToken(_serverPeer.Id);
                 }
 
-                peer.Send("server.started", new GameServerStartMessage { P2PToken = _p2pToken });
+                peer.Send(P2P_TOKEN_ROUTE, _p2pToken);
             }
         }
 
@@ -425,7 +455,7 @@ namespace Stormancer.Server.GameSession
         {
             using (await _lock.LockAsync())
             {
-                if ((_config.userIds.All(id => _clients.Keys.Contains(id)) && _clients.Values.All(client => client.Status == PlayerStatus.Ready) || _config.Public) && _status == ServerStatus.WaitingPlayers)
+                if ((_config.userIds.All(id => _clients.Keys.Contains(id)) || _config.Public) && _status == ServerStatus.WaitingPlayers)
                 {
                     _status = ServerStatus.Starting;
                     _logger.Log(LogLevel.Trace, "gamesession", "Starting game session.", new { });
@@ -439,14 +469,16 @@ namespace Stormancer.Server.GameSession
 
         private async Task Start()
         {
-            var serverEnabled = ((JToken)_configuration?.Settings?.gameServer) != null;
+
+            var applicationInfo = await _environment.GetApplicationInfos();
+           
             var path = (string)_configuration.Settings?.gameServer?.executable;
             var verbose = ((bool?)_configuration.Settings?.gameServer?.verbose) ?? false;
             var log = ((bool?)_configuration.Settings?.gameServer?.log) ?? false;
             var stormancerPort = ((ushort?)_configuration.Settings?.gameServer?.stormancerPort) ?? 30000;
             var arguments = string.Join(" ", ((JArray)_configuration.Settings?.gameServer?.arguments ?? new JArray()).ToObject<IEnumerable<string>>());
 
-            if (!serverEnabled)
+            if (!_serverEnabled)
             {
                 _logger.Log(LogLevel.Trace, "gamesession", "No server executable enabled. Game session started.", new { });
                 _status = ServerStatus.Started;
@@ -471,9 +503,8 @@ namespace Stormancer.Server.GameSession
                         await Task.Delay(TimeSpan.FromSeconds(50));
 
                         _status = ServerStatus.Started;
-                        var gameStartMessage = new GameServerStartMessage { P2PToken = null };
-                        _logger.Log(LogLevel.Trace, "gameserver", "Dummy server started, sending server.started message to connected players.", gameStartMessage);
-                        _scene.Broadcast("server.started", gameStartMessage);
+                        _logger.Log(LogLevel.Trace, "gameserver", "Dummy server started, sending server.started message to connected players.", new { });
+                        _scene.Broadcast("server.started", null);
                     }
                     catch (Exception ex)
                     {
@@ -489,7 +520,8 @@ namespace Stormancer.Server.GameSession
                 var managementClient = await _management.GetApplicationClient();
                 _serverGuid = Guid.NewGuid().ToByteArray();
                 var token = await managementClient.CreateConnectionToken(_scene.Id, _serverGuid, "application/server-id");
-                prc.StartInfo.Arguments = $"PORT={_serverPort.ToString()} " + arguments; // { (log ? "-log" : "")}";//$"-port={_port} {(log ? "-log" : "")}";
+                prc.StartInfo.Arguments = $"PORT={_p2pPort.ToString()} { (log ? "-log" : "")} " + arguments; // { (log ? "-log" : "")}";//$"-port={_port} {(log ? "-log" : "")}";
+                //prc.StartInfo.Arguments = $"PORT={_serverPort.ToString()} " + arguments; // { (log ? "-log" : "")}";//$"-port={_port} {(log ? "-log" : "")}";
                 prc.StartInfo.FileName = path;
                 prc.StartInfo.CreateNoWindow = false;
                 prc.StartInfo.UseShellExecute = false;
@@ -498,9 +530,14 @@ namespace Stormancer.Server.GameSession
                 //prc.StartInfo.RedirectStandardError = true;
                 prc.StartInfo.EnvironmentVariables.Add("connectionToken", token);
                 prc.StartInfo.EnvironmentVariables.Add("P2Pport", _p2pPort.ToString());
-                prc.StartInfo.EnvironmentVariables.Add("serverPort", _serverPort.ToString());
+                //prc.StartInfo.EnvironmentVariables.Add("serverPort", _serverPort.ToString());
                 prc.StartInfo.EnvironmentVariables.Add("publicIp", _ip);
                 prc.StartInfo.EnvironmentVariables.Add("localGridPort", stormancerPort.ToString());
+
+                prc.StartInfo.EnvironmentVariables.Add("endPoint", applicationInfo.ApiEndpoint);
+                prc.StartInfo.EnvironmentVariables.Add("accountID", applicationInfo.AccountId);
+                prc.StartInfo.EnvironmentVariables.Add("applicationtName", applicationInfo.ApplicationName);
+
                 var userData = _config.UserData?.ToString() ?? string.Empty;
                 var b64UserData = Convert.ToBase64String(Encoding.UTF8.GetBytes(userData));
                 prc.StartInfo.EnvironmentVariables.Add("userData", b64UserData);
@@ -684,6 +721,7 @@ namespace Stormancer.Server.GameSession
             }
             return Task.FromResult(0);
         }
+
         public async Task<Action<Stream, ISerializer>> PostResults(Stream inputStream, IScenePeerClient remotePeer)
         {
             if (this._status != ServerStatus.Started)
